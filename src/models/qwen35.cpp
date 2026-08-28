@@ -648,13 +648,14 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
 
         // Preserve the standard [n_vocab, n_outputs] contract for samplers and
         // callers. Tokens outside the shortlist cannot win the draft head.
+        const int64_t n_outputs = selected_logits->ne[2];
         ggml_tensor * logits = ggml_fill(ctx0,
-                ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab, selected_logits->ne[1]),
+                ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab, n_outputs),
                 -INFINITY);
         cur = ggml_set_rows(ctx0, logits,
                 selected_logits,
                 candidate_ids);
-        cur = ggml_reshape_2d(ctx0, cur, n_vocab, cur->ne[2]);
+        cur = ggml_reshape_2d(ctx0, cur, n_vocab, n_outputs);
 
         res->add_input(std::move(inp_vocab));
     } else {
