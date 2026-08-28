@@ -3395,14 +3395,19 @@ static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_
 }
 
 static vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool aligned, bool f32acc,
-                                                  bool use_mask, bool use_mask_opt, bool use_logit_softcap, ggml_type k_type, ggml_type v_type) {
+                                                  bool use_mask, bool use_mask_opt, bool use_logit_softcap, bool fused_gqa_queries, bool fused_one_read, bool fused_pair, bool fused_wave_tiles,
+                                                  ggml_type k_type, ggml_type v_type) {
     const bool old_amd_windows = device->vendor_id == VK_VENDOR_ID_AMD && device->driver_id == vk::DriverId::eAmdProprietary &&
                                  (device->architecture == AMD_GCN || device->architecture == AMD_RDNA1 || device->architecture == AMD_RDNA2);
 
     uint32_t flags = (use_mask_opt      ? 1 : 0) |
                      (use_mask          ? 2 : 0) |
                      (use_logit_softcap ? 4 : 0) |
-                     (old_amd_windows   ? 8 : 0);
+                     (old_amd_windows   ? 8 : 0) |
+                     (fused_gqa_queries ? 16 : 0) |
+                     (fused_one_read    ? 32 : 0) |
+                     (fused_pair        ? 64 : 0) |
+                     (fused_wave_tiles  ? 128 : 0);
 
     const uint32_t subgroup_size = params.disable_subgroups ? 0 : params.subgroup_size;
 
@@ -4082,9 +4087,16 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 continue;
 #endif
             } else {
-                if (f32acc) { spv_data = flash_attn_f32_f16_cm1_data;        spv_size = flash_attn_f32_f16_cm1_len; }
-                else        { spv_data = flash_attn_f32_f16_f16acc_cm1_data; spv_size = flash_attn_f32_f16_f16acc_cm1_len; }
-                name = aligned ? "flash_attn_f32_f16_aligned_cm1" : "flash_attn_f32_f16_cm1";
+                const bool wave_tiles = (fa.first.flags & 128u) != 0;
+                if (wave_tiles) {
+                    if (f32acc) { spv_data = flash_attn_f32_f16_wave_cm1_data;        spv_size = flash_attn_f32_f16_wave_cm1_len; }
+                    else        { spv_data = flash_attn_f32_f16_wave_f16acc_cm1_data; spv_size = flash_attn_f32_f16_wave_f16acc_cm1_len; }
+                    name = aligned ? "flash_attn_f32_f16_wave_aligned_cm1" : "flash_attn_f32_f16_wave_cm1";
+                } else {
+                    if (f32acc) { spv_data = flash_attn_f32_f16_cm1_data;        spv_size = flash_attn_f32_f16_cm1_len; }
+                    else        { spv_data = flash_attn_f32_f16_f16acc_cm1_data; spv_size = flash_attn_f32_f16_f16acc_cm1_len; }
+                    name = aligned ? "flash_attn_f32_f16_aligned_cm1" : "flash_attn_f32_f16_cm1";
+                }
             }
             ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", 7,
                                     sizeof(vk_flash_attn_push_constants), {Br, 1, 1},
@@ -10282,6 +10294,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     const uint32_t HSK = nek0;
     const uint32_t HSV = nev0;
     uint32_t N = neq1;
+    const uint32_t n_queries = N;
     const uint32_t KV = nek1;
 
     GGML_ASSERT(ne0 == HSV);
@@ -10325,8 +10338,37 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     // For coopmat2 FA, we always use the small size (which is still pretty large for gqa).
     vk_fa_tuning_params tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, 512, KV, k_fa_type, v_fa_type, f32acc);
     const uint32_t max_gqa = std::min(tuning_params.block_rows, 32u);
+    static const bool enable_fused_gqa_queries = getenv("GGML_VK_FUSED_GQA_QUERIES") != nullptr;
+    static const bool enable_fused_one_read = getenv("GGML_VK_FUSED_GQA_ONE_READ") != nullptr;
+    static const bool enable_fused_pair = getenv("GGML_VK_FUSED_GQA_PAIR") != nullptr;
+    static const bool enable_fused_wave_tiles = getenv("GGML_VK_FUSED_GQA_WAVE_TILES") != nullptr;
+    static const uint32_t fused_scalar_block_rows = []() {
+        const char * value = getenv("GGML_VK_FUSED_GQA_SCALAR_BLOCK_ROWS");
+        if (value == nullptr) {
+            return 0u;
+        }
+        const unsigned long rows = strtoul(value, nullptr, 10);
+        return rows == 24 || rows == 32 ? (uint32_t) rows : 0u;
+    }();
 
-    if (N <= 8 && qk_ratio > 1 && qk_ratio <= max_gqa &&
+    bool fused_gqa_queries = false;
+    const bool coopmat_fused_experiment =
+        (enable_fused_one_read || enable_fused_pair || enable_fused_wave_tiles) &&
+        (tuning_params.path == FA_COOPMAT1 || tuning_params.path == FA_COOPMAT2);
+    if ((enable_fused_gqa_queries || coopmat_fused_experiment) &&
+        N > 1 && N <= 8 && qk_ratio > 1 && qk_ratio <= max_gqa &&
+        N * qk_ratio <= 64 && qk_ratio * nek2 == neq2 && nek2 == nev2 && nem2 <= 1 &&
+        nbq2 == nbq1 * (size_t) N) {
+        // Verification-shaped GQA. Q is contiguous as [head_dim, query, head],
+        // so flattening query and the heads that share one KV head lets one
+        // workgroup reuse every KV tile across the complete speculative block.
+        gqa_ratio = qk_ratio;
+        N *= gqa_ratio;
+        workgroups_x = (enable_fused_one_read || enable_fused_wave_tiles) ? 1 :
+            CEIL_DIV(N, tuning_params.block_rows * (enable_fused_pair ? 2u : 1u));
+        workgroups_y /= gqa_ratio;
+        fused_gqa_queries = true;
+    } else if (N <= 8 && qk_ratio > 1 && qk_ratio <= max_gqa &&
         qk_ratio * nek2 == neq2 && nek2 == nev2 && nem2 <= 1) {
         // grouped query attention - make the N dimension equal to gqa_ratio, reduce
         // workgroups proportionally in y dimension. The shader will detect gqa_ratio > 1
@@ -10337,6 +10379,19 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     }
 
     tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k_fa_type, v_fa_type, f32acc);
+    if (fused_gqa_queries && tuning_params.path == FA_SCALAR && fused_scalar_block_rows > 0) {
+        // Qwen width three expands to 18 rows and wastes 14 lanes across two
+        // ordinary 16-row scalar workgroups. Experimental 24/32-row tiles
+        // trade private state for one fewer full KV walk.
+        tuning_params.block_rows = fused_scalar_block_rows;
+        workgroups_x = CEIL_DIV(N, tuning_params.block_rows);
+    }
+    if (fused_gqa_queries && enable_fused_wave_tiles && tuning_params.path == FA_COOPMAT1) {
+        // Three row tiles, each with the four column/row partitions expected
+        // by the KHR cooperative-matrix shader. Every wave owns one tile's
+        // accumulators while the complete workgroup shares staged K/V.
+        tuning_params.workgroup_size = 3u * tuning_params.row_split * tuning_params.subgroup_size;
+    }
 
     // Turbo fallback pre-dequant preserves KV-cache memory order ([head_dim, head, kv])
     // and uses strides here to present the graph's logical [head_dim, kv, head] view to FA.
@@ -10375,9 +10430,12 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     }
 
     // Only use mask opt when the mask is fairly large. This hasn't been tuned extensively.
-    bool use_mask_opt = mask && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16;
+    bool use_mask_opt = !fused_gqa_queries && mask && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16;
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
-                                                                   mask != nullptr, use_mask_opt, logit_softcap != 0, k_fa_type, v_fa_type);
+                                                                   mask != nullptr, use_mask_opt, logit_softcap != 0, fused_gqa_queries, enable_fused_one_read && fused_gqa_queries,
+                                                                   enable_fused_pair && fused_gqa_queries,
+                                                                   enable_fused_wave_tiles && fused_gqa_queries,
+                                                                   k_fa_type, v_fa_type);
 
     vk_pipeline pipeline = nullptr;
 
@@ -10412,8 +10470,12 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     const uint32_t Tr = CEIL_DIV(N, Br);
 
     // Try to use split_k when KV is large enough to be worth the overhead.
-    if (gqa_ratio > 1 && workgroups_x <= Br) {
-        split_k = shader_core_count * 2 / (workgroups_x * workgroups_y * workgroups_z);
+    const uint32_t split_gate_workgroups_x = fused_gqa_queries ? n_queries : workgroups_x;
+    if (gqa_ratio > 1 && split_gate_workgroups_x <= Br) {
+        // Keep the same split-K family as the expanded per-query GQA path.
+        // Changing the partition count also changes floating-point reduction
+        // order and breaks the verifier's parity contract.
+        split_k = shader_core_count * 2 / (split_gate_workgroups_x * workgroups_y * workgroups_z);
     } else if (gqa_ratio <= 1) {
         uint32_t total_wgs_no_split = Tr * workgroups_y * workgroups_z;
         if (total_wgs_no_split < shader_core_count * 2) {

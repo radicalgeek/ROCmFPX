@@ -104,6 +104,7 @@ layout (binding = 0) readonly buffer Q {uint8_t data_q[];};
 layout (binding = 1) readonly buffer K {uint8_t data_k[];};
 layout (binding = 2) readonly buffer V {uint8_t data_v[];};
 layout (binding = 3) readonly buffer M {uint8_t data_m[];};
+layout (binding = 3) readonly buffer MF16 {float16_t data_m_f16[];};
 
 ACC_TYPE maxReduce(const in ACC_TYPE x, const in ACC_TYPE y) {
     return max(x, y);
@@ -168,6 +169,50 @@ ACC_TYPE perElemOpNonGqaSplitKStoreCol0(const in uint32_t r, const in uint32_t c
     return elem;
 }
 
+float16_t perElemOpFusedGqaMask(const in uint32_t r, const in uint32_t c, const in float16_t elem, const in uint32_t mask_base, const in uint32_t col_base) {
+    const uint32_t global_row = i * Br + r;
+    if (global_row >= N || col_base + c >= KV) {
+        return float16_t(-65504.0);
+    }
+
+    const uint32_t query = global_row % p.ne2;
+    return data_m_f16[mask_base + query * KV + col_base + c];
+}
+
+D_TYPE perElemOpFusedGqaStore(const in uint32_t r, const in uint32_t c, const in D_TYPE elem) {
+    const uint32_t global_row = i * Br + r;
+    if (global_row < N && c < HSV) {
+        const uint32_t query = global_row % p.ne2;
+        const uint32_t head = iq2 + global_row / p.ne2;
+        const uint32_t offset = ((iq3 * p.ne2 + query) * p.ne1 + head) * HSV + c;
+        data_o[offset] = elem;
+    }
+    return elem;
+}
+
+D_TYPE perElemOpFusedGqaSplitKStore(const in uint32_t r, const in uint32_t c, const in D_TYPE elem) {
+    const uint32_t global_row = i * Br + r;
+    if (global_row < N && c < HSV) {
+        const uint32_t query = global_row % p.ne2;
+        const uint32_t head = iq2 + global_row / p.ne2;
+        const uint32_t offset = HSV * p.ne1 * (split_k_index + p.k_num * (query + p.ne2 * iq3)) + head * HSV + c;
+        data_o[offset] = elem;
+    }
+    return elem;
+}
+
+ACC_TYPE perElemOpFusedGqaSplitKStoreCol0(const in uint32_t r, const in uint32_t c, const in ACC_TYPE elem, const in uint32_t lm_plane) {
+    const uint32_t global_row = i * Br + r;
+    if (global_row < N && c == 0) {
+        const uint32_t query = global_row % p.ne2;
+        const uint32_t head = iq2 + global_row / p.ne2;
+        const uint32_t lm_base = HSV * p.ne1 * p.k_num * p.ne2 * p.ne3;
+        const uint32_t seq_base = p.ne1 * 2 * (split_k_index + p.k_num * (query + p.ne2 * iq3));
+        data_o[lm_base + seq_base + lm_plane * p.ne1 + head] = D_TYPE(elem);
+    }
+    return elem;
+}
+
 void main() {
     init_indices();
 
@@ -205,7 +250,9 @@ void main() {
     coopmat<Q_TYPE, gl_ScopeWorkgroup, Br, HSK_pad, gl_MatrixUseAccumulator> Q;
     coopmat<FLOAT_TYPE, gl_ScopeWorkgroup, Br, HSK_pad, gl_MatrixUseA> Qf16;
 
-    uint32_t q_offset = gqa_iq1*p.nb01*4/*sizeof(float)*/ + iq2*p.nb02+iq3*p.nb03;
+    uint32_t q_offset = FUSED_GQA_QUERIES
+        ? iq2*p.nb02 + iq3*p.nb03
+        : gqa_iq1*p.nb01*4/*sizeof(float)*/ + iq2*p.nb02+iq3*p.nb03;
     coopMatLoadTensorNV(Q, data_q, q_offset, sliceTensorLayoutNV(tensorLayoutQ, i * Br, Br, 0, HSK_pad));
 
     Q *= Q_TYPE(p.scale);
@@ -262,36 +309,50 @@ void main() {
             }
             // Only load if the block is not all zeros
             if (mask_opt_bits != MASK_OPT_ALL_ZERO) {
-                bool nem1_bounds_check = !(p.gqa_ratio > 1) && (p.nem1 % Br) != 0;
-
-                if (nem1_bounds_check) {
-                    tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> tensorLayoutM = createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
-                    tensorLayoutM = setTensorLayoutDimensionNV(tensorLayoutM, p.nem1, KV);
-                    tensorLayoutM = setTensorLayoutStrideNV(tensorLayoutM, m_stride, 1);
-                    tensorLayoutM = setTensorLayoutClampValueNV(tensorLayoutM, 0xfc00); // -inf in float16_t
+                if (FUSED_GQA_QUERIES) {
+                    uint32_t mask_base = 0;
+                    if (p.nem2 != 1 || p.nem3 != 1) {
+                        mask_base = ((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * p.nem1 * KV;
+                    }
 
                     coopmat<float16_t, gl_ScopeWorkgroup, Br, Bc, gl_MatrixUseAccumulator> mvmax;
-
-                    coopMatLoadTensorNV(mv, data_m, m_offset, sliceTensorLayoutNV(tensorLayoutM, i * Br, Br, j * Bc, Bc));
-                    // skip the block if the mask is entirely -inf
+                    coopMatPerElementNV(mv, mv, perElemOpFusedGqaMask, mask_base, j * Bc);
                     coopMatReduceNV(mvmax, mv, gl_CooperativeMatrixReduceRowAndColumnNV, maxReduceFp16);
                     if (mvmax[0] <= NEG_FLT_MAX_OVER_2) {
                         continue;
                     }
                 } else {
-                    tensorLayoutNV<2, Clamp> tensorLayoutM = createTensorLayoutNV(2, Clamp);
-                    // Don't clamp against nem1 when GQA is enabled
-                    uint32_t m_height = p.gqa_ratio > 1 ? ~0 : p.nem1;
-                    tensorLayoutM = setTensorLayoutDimensionNV(tensorLayoutM, m_height, KV);
-                    tensorLayoutM = setTensorLayoutStrideNV(tensorLayoutM, m_stride, 1);
+                    bool nem1_bounds_check = !(p.gqa_ratio > 1) && (p.nem1 % Br) != 0;
 
-                    coopmat<float16_t, gl_ScopeWorkgroup, Br, Bc, gl_MatrixUseAccumulator> mvmax;
+                    if (nem1_bounds_check) {
+                        tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> tensorLayoutM = createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
+                        tensorLayoutM = setTensorLayoutDimensionNV(tensorLayoutM, p.nem1, KV);
+                        tensorLayoutM = setTensorLayoutStrideNV(tensorLayoutM, m_stride, 1);
+                        tensorLayoutM = setTensorLayoutClampValueNV(tensorLayoutM, 0xfc00); // -inf in float16_t
 
-                    coopMatLoadTensorNV(mv, data_m, m_offset, sliceTensorLayoutNV(tensorLayoutM, i * Br, Br, j * Bc, Bc));
-                    // skip the block if the mask is entirely -inf
-                    coopMatReduceNV(mvmax, mv, gl_CooperativeMatrixReduceRowAndColumnNV, maxReduceFp16);
-                    if (mvmax[0] <= NEG_FLT_MAX_OVER_2) {
-                        continue;
+                        coopmat<float16_t, gl_ScopeWorkgroup, Br, Bc, gl_MatrixUseAccumulator> mvmax;
+
+                        coopMatLoadTensorNV(mv, data_m, m_offset, sliceTensorLayoutNV(tensorLayoutM, i * Br, Br, j * Bc, Bc));
+                        // skip the block if the mask is entirely -inf
+                        coopMatReduceNV(mvmax, mv, gl_CooperativeMatrixReduceRowAndColumnNV, maxReduceFp16);
+                        if (mvmax[0] <= NEG_FLT_MAX_OVER_2) {
+                            continue;
+                        }
+                    } else {
+                        tensorLayoutNV<2, Clamp> tensorLayoutM = createTensorLayoutNV(2, Clamp);
+                        // Don't clamp against nem1 when GQA is enabled
+                        uint32_t m_height = p.gqa_ratio > 1 ? ~0 : p.nem1;
+                        tensorLayoutM = setTensorLayoutDimensionNV(tensorLayoutM, m_height, KV);
+                        tensorLayoutM = setTensorLayoutStrideNV(tensorLayoutM, m_stride, 1);
+
+                        coopmat<float16_t, gl_ScopeWorkgroup, Br, Bc, gl_MatrixUseAccumulator> mvmax;
+
+                        coopMatLoadTensorNV(mv, data_m, m_offset, sliceTensorLayoutNV(tensorLayoutM, i * Br, Br, j * Bc, Bc));
+                        // skip the block if the mask is entirely -inf
+                        coopMatReduceNV(mvmax, mv, gl_CooperativeMatrixReduceRowAndColumnNV, maxReduceFp16);
+                        if (mvmax[0] <= NEG_FLT_MAX_OVER_2) {
+                            continue;
+                        }
                     }
                 }
             }
@@ -404,6 +465,12 @@ void main() {
         coopmat<D_TYPE, gl_ScopeWorkgroup, Br, HSV_pad, gl_MatrixUseAccumulator> O_D = coopmat<D_TYPE, gl_ScopeWorkgroup, Br, HSV_pad, gl_MatrixUseAccumulator>(O);
 
         if (p.gqa_ratio > 1) {
+            if (FUSED_GQA_QUERIES) {
+                coopMatPerElementNV(O_D, O_D, perElemOpFusedGqaSplitKStore);
+                coopMatPerElementNV(L, L, perElemOpFusedGqaSplitKStoreCol0, 0u);
+                coopMatPerElementNV(M, M, perElemOpFusedGqaSplitKStoreCol0, 1u);
+                return;
+            }
             // note: O and Q have swapped coord 1,2.
             uint32_t o_offset = HSV * p.ne1 * (split_k_index + p.k_num * (gqa_iq1 + p.ne2 * iq3));
             coopMatPerElementNV(O_D, O_D, perElemOpGqaStore, o_offset, iq2, N);
@@ -468,7 +535,11 @@ void main() {
     uint32_t o_offset = gqa_iq1*p.ne1*HSV + iq3*p.ne2*p.ne1*HSV;
 
     if (p.gqa_ratio > 1) {
-        coopMatPerElementNV(O_D, O_D, perElemOpGqaStore, o_offset, iq2, N);
+        if (FUSED_GQA_QUERIES) {
+            coopMatPerElementNV(O_D, O_D, perElemOpFusedGqaStore);
+        } else {
+            coopMatPerElementNV(O_D, O_D, perElemOpGqaStore, o_offset, iq2, N);
+        }
     } else {
         tensorLayoutNV<3, gl_CooperativeMatrixClampModeConstantNV> tensorLayoutD = createTensorLayoutNV(3, gl_CooperativeMatrixClampModeConstantNV);
         tensorLayoutD = setTensorLayoutDimensionNV(tensorLayoutD, p.ne2, p.ne1, HSV);

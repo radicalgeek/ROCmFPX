@@ -9057,6 +9057,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q1_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 64, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_F16));
+    // Qwen3.8-27B verification: four KV heads and eight query heads per KV
+    // head, including masked tails and attention sinks.
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {8, 1}, 256, 6, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {8, 1}, 257, 7, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {8, 1}, 256, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {8, 1}, 259, 3, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {8, 1}, 259, 5, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {8, 1}, 256, 6, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {8, 1}, 257, 7, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {8, 1}, 256, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0_ROCMFP4, GGML_TYPE_Q4_0_ROCMFP4));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_Q4_0_ROCMFP4_FAST));
     // Packed TurboQuant FA: cover every compiled symmetric/asymmetric K/V pair.
@@ -9430,10 +9440,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {12, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0_ROCMFP4, GGML_TYPE_Q4_0_ROCMFP4));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {12, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_Q4_0_ROCMFP4_FAST));
 
-    // Qwen3.8-27B attention: four KV heads, eight query heads per KV
-    // head, and both serial and six-row speculative verification shapes.
-    for (int64_t kv : { 65536, 200000 }) {
-        for (int64_t nb : { 1, 6 }) {
+    // Qwen3.8-27B long-context attention, including serial decode and the
+    // speculative widths used by the adaptive policy.
+    for (int64_t kv : { 8192, 65536, 200000 }) {
+        for (int64_t nb : { 1, 3, 4, 5, 6, 8 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {8, 1}, kv, nb, true, false, 0, 0,
+                                                            GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {8, 1}, kv, nb, true, false, 0, 0,
                                                             GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_F16));
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {8, 1}, kv, nb, true, false, 0, 0,

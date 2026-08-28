@@ -26,6 +26,14 @@ const bool USE_MASK_OPT    = (Flags & 1) != 0;
 const bool MASK_ENABLE     = (Flags & 2) != 0;
 const bool LOGIT_SOFTCAP   = (Flags & 4) != 0;
 const bool OLD_AMD_WINDOWS = (Flags & 8) != 0;
+const bool FUSED_GQA_QUERIES = (Flags & 16) != 0;
+const bool FUSED_GQA_ONE_READ = (Flags & 32) != 0;
+const bool FUSED_GQA_PAIR = (Flags & 64) != 0;
+#if defined(FA_WAVE_TILES)
+const bool FUSED_GQA_WAVE_TILES = true;
+#else
+const bool FUSED_GQA_WAVE_TILES = false;
+#endif
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;
@@ -199,6 +207,9 @@ bool fa_type_needs_shmem(uint ty) {
 
 #define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
 
+uint32_t i, N, KV, split_k_index, Tr, start_j, end_j,
+         gqa_iq1, iq2, iq3, rk2, rk3, rv2, rv3, ik2, ik3, iv2, iv3,
+         q_stride, k_stride, v_stride, m_stride;
 
 // Store column zero. This is used to save per-row m and L values for split_k.
 ACC_TYPE perElemOpStoreCol0(const in uint32_t r, const in uint32_t c, const in ACC_TYPE elem, const in uint32_t o_offset, const in uint32_t iq2, const in uint32_t N)
@@ -213,7 +224,8 @@ ACC_TYPE perElemOpStoreCol0(const in uint32_t r, const in uint32_t c, const in A
 // Load the slope matrix, indexed by Q's dimension 2.
 ACC_TYPE perElemOpComputeSlope(const in uint32_t r, const in uint32_t c, const in ACC_TYPE elem, const in uint32_t iq2)
 {
-    const uint32_t h = iq2 + (r % p.gqa_ratio);
+    const uint32_t global_row = i * Br + r;
+    const uint32_t h = iq2 + (FUSED_GQA_QUERIES ? global_row / p.ne2 : r % p.gqa_ratio);
 
     uint32_t n_head_log2 = p.mask_n_head_log2 & N_LOG2_MASK;
 
@@ -226,14 +238,11 @@ ACC_TYPE perElemOpComputeSlope(const in uint32_t r, const in uint32_t c, const i
 // Load the sink value, indexed by Q's dimension 2.
 ACC_TYPE perElemOpGetSink(const in uint32_t r, const in uint32_t c, const in ACC_TYPE elem, const in uint32_t iq2)
 {
-    const uint32_t h = iq2 + (r % p.gqa_ratio);
+    const uint32_t global_row = i * Br + r;
+    const uint32_t h = iq2 + (FUSED_GQA_QUERIES ? global_row / p.ne2 : r % p.gqa_ratio);
 
     return ACC_TYPE(data_s[h]);
 }
-
-uint32_t i, N, KV, split_k_index, Tr, start_j, end_j,
-         gqa_iq1, iq2, iq3, rk2, rk3, rv2, rv3, ik2, ik3, iv2, iv3,
-         q_stride, k_stride, v_stride, m_stride;
 
 void init_indices()
 {
@@ -242,9 +251,10 @@ void init_indices()
 
     if (p.k_num > 1) {
         if (p.gqa_ratio > 1) {
-            i = 0;
-            // batch and split_k share gl_WorkGroupID.x
-            gqa_iq1 = gl_WorkGroupID.x / p.k_num;
+            // Fused verification uses x for row tile and split-K. Expanded
+            // GQA uses x for query and split-K.
+            i = FUSED_GQA_QUERIES ? (gl_WorkGroupID.x / p.k_num) * (FUSED_GQA_PAIR ? 2 : 1) : 0;
+            gqa_iq1 = FUSED_GQA_QUERIES ? 0 : gl_WorkGroupID.x / p.k_num;
             split_k_index = gl_WorkGroupID.x % p.k_num;
         } else {
             gqa_iq1 = 0;
@@ -252,8 +262,8 @@ void init_indices()
             i = gl_WorkGroupID.x / p.k_num;
         }
     } else if (p.gqa_ratio > 1) {
-        i = 0;
-        gqa_iq1 = gl_WorkGroupID.x;
+        i = FUSED_GQA_QUERIES ? gl_WorkGroupID.x * (FUSED_GQA_PAIR ? 2 : 1) : 0;
+        gqa_iq1 = FUSED_GQA_QUERIES ? 0 : gl_WorkGroupID.x;
         split_k_index = 0;
     } else {
         i = gl_WorkGroupID.x;
@@ -289,7 +299,7 @@ void init_indices()
     // nb?1 are already divided by the type size and are in units of elements.
     // When using grouped query attention, Q is indexed by iq2, so the stride
     // should be nb02 (which is in bytes).
-    q_stride = p.gqa_ratio > 1 ? (p.nb02 / 4) : p.nb01;
+    q_stride = p.gqa_ratio > 1 && !FUSED_GQA_QUERIES ? (p.nb02 / 4) : p.nb01;
     k_stride = p.nb11;
     v_stride = p.nb21;
     // When using grouped query attention, all rows use the same mask (stride 0).
