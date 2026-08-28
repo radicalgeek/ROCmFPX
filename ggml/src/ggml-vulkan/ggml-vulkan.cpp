@@ -1823,21 +1823,23 @@ private:
 std::mutex vk_memory_logger::log_mutex;
 
 static bool vk_perf_logger_enabled = false;
+static bool vk_perf_logger_env_enabled = false;
 static bool vk_perf_logger_configured = false;
 static bool vk_perf_logger_concurrent = false;
 static bool vk_enable_sync_logger = false;
 // number of calls between perf logger prints
 static uint32_t vk_perf_logger_frequency = 1;
+static uint32_t vk_perf_logger_max_rows = 0;
 static std::string vk_pipeline_stats_filter;
 static std::string vk_perf_logger_toggle_file;
 
 static bool ggml_vk_perf_logger_requested() {
     if (vk_perf_logger_toggle_file.empty()) {
-        return vk_perf_logger_enabled;
+        return vk_perf_logger_env_enabled;
     }
 
     std::ifstream toggle(vk_perf_logger_toggle_file);
-    return vk_perf_logger_enabled || toggle.good();
+    return vk_perf_logger_env_enabled || toggle.good();
 }
 
 class vk_perf_logger {
@@ -6780,7 +6782,8 @@ static void ggml_vk_instance_init() {
         vk_instance.pfn_vkCmdInsertDebugUtilsLabelEXT = (PFN_vkCmdInsertDebugUtilsLabelEXT) vkGetInstanceProcAddr(vk_instance.instance, "vkCmdInsertDebugUtilsLabelEXT");
     }
 
-    vk_perf_logger_enabled = getenv("GGML_VK_PERF_LOGGER") != nullptr;
+    vk_perf_logger_env_enabled = getenv("GGML_VK_PERF_LOGGER") != nullptr;
+    vk_perf_logger_enabled = vk_perf_logger_env_enabled;
     const char * perf_logger_toggle_file = getenv("GGML_VK_PERF_LOGGER_TOGGLE_FILE");
     if (perf_logger_toggle_file != nullptr) {
         vk_perf_logger_toggle_file = perf_logger_toggle_file;
@@ -6797,6 +6800,10 @@ static void ggml_vk_instance_init() {
 
     if (GGML_VK_PERF_LOGGER_FREQUENCY != nullptr) {
         vk_perf_logger_frequency = std::stoul(GGML_VK_PERF_LOGGER_FREQUENCY);
+    }
+    const char * perf_logger_max_rows = getenv("GGML_VK_PERF_LOGGER_MAX_ROWS");
+    if (perf_logger_max_rows != nullptr) {
+        vk_perf_logger_max_rows = std::stoul(perf_logger_max_rows);
     }
 
     // See https://github.com/KhronosGroup/Vulkan-Hpp?tab=readme-ov-file#extensions--per-device-function-pointers-
@@ -16208,10 +16215,31 @@ static int32_t find_first_set(uint32_t x) {
     return ret;
 }
 
+static bool ggml_vk_perf_logger_graph_matches(const ggml_cgraph * cgraph) {
+    if (vk_perf_logger_max_rows == 0) {
+        return true;
+    }
+
+    bool found_mul_mat = false;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID) {
+            continue;
+        }
+
+        found_mul_mat = true;
+        if (node->ne[1] > vk_perf_logger_max_rows) {
+            return false;
+        }
+    }
+
+    return found_mul_mat;
+}
+
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
-    vk_perf_logger_enabled = ggml_vk_perf_logger_requested();
+    vk_perf_logger_enabled = ggml_vk_perf_logger_requested() && ggml_vk_perf_logger_graph_matches(cgraph);
 
     if (vk_instance.debug_utils_support) {
         vk::DebugUtilsLabelEXT dul = {};
