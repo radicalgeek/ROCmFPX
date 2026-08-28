@@ -116,6 +116,8 @@ struct llama_context {
     void set_embeddings (bool value);
     void set_embeddings_pre_norm(bool value, bool masked = false);
     void set_mtp_source(llama_context * src);
+    size_t mtp_vocab_candidate_capacity() const;
+    bool set_mtp_vocab_candidates(const llama_token * tokens, size_t n_tokens);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
@@ -327,6 +329,11 @@ private:
     };
 
     sampling_info sampling;
+
+    // Experimental MTP-only vocabulary projection. Capacity is fixed when the
+    // context is constructed so graph topology remains reusable; token IDs may
+    // change between decode calls.
+    std::vector<llama_token> mtp_vocab_candidates;
 
     // sequence embeddings output (map of [n_embd] vectors)
     // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE

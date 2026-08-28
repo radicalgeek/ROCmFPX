@@ -14,6 +14,7 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -234,6 +235,26 @@ llama_context::llama_context(
 
         if (graph_build_timing) {
             LLAMA_LOG_INFO("%s: graph build timing enabled\n", __func__);
+        }
+
+        if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+            const char * env = getenv("LLAMA_MTP_VOCAB_SHORTLIST");
+            if (env != nullptr) {
+                char * end = nullptr;
+                const long requested = std::strtol(env, &end, 10);
+                const size_t n_vocab = model.vocab.n_tokens();
+                if (end != env && *end == '\0' && requested >= 256 && (size_t) requested < n_vocab) {
+                    mtp_vocab_candidates.resize((size_t) requested);
+                    for (size_t i = 0; i < mtp_vocab_candidates.size(); ++i) {
+                        mtp_vocab_candidates[i] = (llama_token) i;
+                    }
+                    LLAMA_LOG_INFO("%s: MTP vocabulary shortlist enabled: %zu / %zu rows\n",
+                            __func__, mtp_vocab_candidates.size(), n_vocab);
+                } else {
+                    LLAMA_LOG_WARN("%s: ignoring invalid LLAMA_MTP_VOCAB_SHORTLIST='%s' (expected 256..%zu)\n",
+                            __func__, env, n_vocab - 1);
+                }
+            }
         }
     }
 
@@ -1208,6 +1229,26 @@ void llama_context::set_mtp_source(llama_context * src) {
     src_ctx = src;
     src_mctx_for_decode.reset();
     sched_need_reserve = true;
+}
+
+size_t llama_context::mtp_vocab_candidate_capacity() const {
+    return mtp_vocab_candidates.size();
+}
+
+bool llama_context::set_mtp_vocab_candidates(const llama_token * tokens, size_t n_tokens) {
+    if (mtp_vocab_candidates.empty() || tokens == nullptr || n_tokens != mtp_vocab_candidates.size()) {
+        return false;
+    }
+
+    const size_t n_vocab = model.vocab.n_tokens();
+    for (size_t i = 0; i < n_tokens; ++i) {
+        if (tokens[i] < 0 || (size_t) tokens[i] >= n_vocab) {
+            return false;
+        }
+    }
+
+    std::copy(tokens, tokens + n_tokens, mtp_vocab_candidates.begin());
+    return true;
 }
 
 void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
@@ -2533,6 +2574,7 @@ llm_graph_params llama_context::graph_params(
         /*.src_mctx    =*/ src_mctx_for_decode.get(),
         /*.src_model   =*/ (src_ctx ? &src_ctx->get_model() : (cparams.ctx_other ? llama_get_model(cparams.ctx_other) : nullptr)),
         /*.cross       =*/ &cross,
+        /*.mtp_vocab_candidates =*/ mtp_vocab_candidates.empty() ? nullptr : &mtp_vocab_candidates,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -3891,6 +3933,14 @@ void llama_set_embeddings_pre_norm(llama_context * ctx, bool value, bool masked)
 
 void llama_set_mtp_source(llama_context * ctx, llama_context * src) {
     ctx->set_mtp_source(src);
+}
+
+size_t llama_mtp_vocab_candidate_capacity(const llama_context * ctx) {
+    return ctx->mtp_vocab_candidate_capacity();
+}
+
+bool llama_set_mtp_vocab_candidates(llama_context * ctx, const llama_token * tokens, size_t n_tokens) {
+    return ctx->set_mtp_vocab_candidates(tokens, n_tokens);
 }
 
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {

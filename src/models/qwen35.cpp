@@ -626,7 +626,35 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
 
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
-    cur = build_lora_mm(head_w, cur);
+
+    if (params.mtp_vocab_candidates != nullptr && !params.mtp_vocab_candidates->empty()) {
+        const int64_t n_candidates = (int64_t) params.mtp_vocab_candidates->size();
+        const int64_t n_vocab = (int64_t) model.vocab.n_tokens();
+
+        auto inp_vocab = std::make_unique<llm_graph_input_mtp_vocab_candidates>(params.mtp_vocab_candidates);
+        inp_vocab->ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_candidates);
+        ggml_set_input(inp_vocab->ids);
+        ggml_set_name(inp_vocab->ids, "mtp_vocab_candidates");
+
+        ggml_tensor * selected_head = ggml_get_rows(ctx0, head_w, inp_vocab->ids);
+        cb(selected_head, "mtp_selected_head", -1);
+        ggml_tensor * selected_logits = build_lora_mm(selected_head, cur);
+        cb(selected_logits, "mtp_selected_logits", -1);
+
+        // Preserve the standard [n_vocab, n_outputs] contract for samplers and
+        // callers. Tokens outside the shortlist cannot win the draft head.
+        ggml_tensor * logits = ggml_fill(ctx0,
+                ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab, selected_logits->ne[1]),
+                -INFINITY);
+        cur = ggml_set_rows(ctx0, logits,
+                ggml_reshape_3d(ctx0, selected_logits, 1, n_candidates, selected_logits->ne[1]),
+                ggml_reshape_3d(ctx0, inp_vocab->ids, n_candidates, 1, 1));
+        cur = ggml_reshape_2d(ctx0, cur, n_vocab, selected_logits->ne[1]);
+
+        res->add_input(std::move(inp_vocab));
+    } else {
+        cur = build_lora_mm(head_w, cur);
+    }
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;

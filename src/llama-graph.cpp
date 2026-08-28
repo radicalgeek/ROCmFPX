@@ -76,6 +76,20 @@ bool llm_graph_input_mtp_speculative_step::can_reuse(const llm_graph_params &) {
     return step == llm_graph_get_mtp_speculative_step();
 }
 
+void llm_graph_input_mtp_vocab_candidates::set_input(const llama_ubatch *) {
+    GGML_ASSERT(candidates != nullptr);
+    GGML_ASSERT(ids != nullptr);
+    GGML_ASSERT((size_t) ids->ne[0] == candidates->size());
+
+    ggml_backend_tensor_set(ids, candidates->data(), 0, candidates->size() * sizeof(llama_token));
+}
+
+bool llm_graph_input_mtp_vocab_candidates::can_reuse(const llm_graph_params & params) {
+    return params.mtp_vocab_candidates != nullptr &&
+           candidates != nullptr &&
+           params.mtp_vocab_candidates->size() == candidates->size();
+}
+
 static ggml_tensor * ggml_mul_mat_aux(
         ggml_context * ctx,
         ggml_tensor * cur,

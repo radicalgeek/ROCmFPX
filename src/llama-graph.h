@@ -125,6 +125,20 @@ public:
     const int32_t step;
 };
 
+class llm_graph_input_mtp_vocab_candidates : public llm_graph_input_i {
+public:
+    llm_graph_input_mtp_vocab_candidates(const std::vector<llama_token> * candidates) : candidates(candidates) {}
+    ~llm_graph_input_mtp_vocab_candidates() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * ids = nullptr; // I32 [n_candidates]
+
+    const std::vector<llama_token> * candidates;
+};
+
 class llm_graph_input_embd : public llm_graph_input_i {
 public:
     llm_graph_input_embd(int64_t n_embd) : n_embd(n_embd) {}
@@ -694,6 +708,10 @@ struct llm_graph_params {
     const llama_memory_context_i * src_mctx;
     const llama_model            * src_model;
     const llama_cross            * cross;
+
+    // Optional fixed-capacity, dynamically populated vocabulary for MTP-only
+    // output projection. The target model still verifies every draft.
+    const std::vector<llama_token> * mtp_vocab_candidates;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

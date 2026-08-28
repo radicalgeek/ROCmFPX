@@ -17,7 +17,10 @@
 #include <iomanip>
 #include <map>
 #include <cinttypes>
+#include <deque>
 #include <stdexcept>
+#include <unordered_map>
+#include <unordered_set>
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
@@ -1375,6 +1378,15 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    // A prompt-local vocabulary is sufficient for most draft guesses and
+    // avoids reading the complete Q8 LM head on every MTP step. The target
+    // model still verifies every token, so shortlist misses affect speed only.
+    size_t mtp_vocab_capacity = 0;
+    std::vector<std::unordered_map<llama_token, uint32_t>> mtp_prompt_token_counts;
+    std::deque<llama_token> mtp_recent_tokens;
+    std::vector<llama_token> mtp_vocab_candidates;
+    std::unordered_set<llama_token> mtp_vocab_candidate_set;
+
     // Ring of the most recent boundary h-rows per seq, so that a bounded
     // memory rollback (prompt-cache boundary salvage, see the server) can
     // rewind pending_h to any of the last RING_N positions without a full
@@ -1492,6 +1504,13 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
 
         last_n_drafted.assign(n_seq, 0);
         drafting.assign(n_seq, 0);
+
+        mtp_vocab_capacity = llama_mtp_vocab_candidate_capacity(ctx_dft);
+        if (mtp_vocab_capacity > 0) {
+            mtp_prompt_token_counts.resize(n_seq);
+            mtp_vocab_candidates.reserve(mtp_vocab_capacity);
+            mtp_vocab_candidate_set.reserve(mtp_vocab_capacity * 2);
+        }
     }
 
     ~common_speculative_state_draft_mtp() override {
@@ -1514,12 +1533,80 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
         llama_batch_free(batch);
     }
 
+    void rebuild_mtp_vocab_candidates() {
+        if (mtp_vocab_capacity == 0) {
+            return;
+        }
+
+        std::unordered_map<llama_token, uint64_t> counts;
+        size_t count_hint = 0;
+        for (const auto & per_seq : mtp_prompt_token_counts) {
+            count_hint += per_seq.size();
+        }
+        counts.reserve(count_hint);
+        for (const auto & per_seq : mtp_prompt_token_counts) {
+            for (const auto & [token, count] : per_seq) {
+                counts[token] += count;
+            }
+        }
+
+        std::vector<std::pair<llama_token, uint64_t>> ranked(counts.begin(), counts.end());
+        std::sort(ranked.begin(), ranked.end(), [](const auto & a, const auto & b) {
+            return a.second != b.second ? a.second > b.second : a.first < b.first;
+        });
+
+        mtp_vocab_candidates.clear();
+        mtp_vocab_candidate_set.clear();
+
+        auto add = [&](llama_token token) {
+            if (mtp_vocab_candidates.size() < mtp_vocab_capacity && mtp_vocab_candidate_set.insert(token).second) {
+                mtp_vocab_candidates.push_back(token);
+            }
+        };
+
+        // Give newly observed target tokens first claim on a small rolling
+        // portion, then rank prompt tokens by frequency and fill spare slots
+        // with low token IDs (which contain much of Qwen's common vocabulary).
+        for (auto it = mtp_recent_tokens.rbegin(); it != mtp_recent_tokens.rend(); ++it) {
+            add(*it);
+        }
+        for (const auto & [token, count] : ranked) {
+            GGML_UNUSED(count);
+            add(token);
+        }
+
+        const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(params.ctx_dft)));
+        for (llama_token token = 0;
+             token < n_vocab && mtp_vocab_candidates.size() < mtp_vocab_capacity;
+             ++token) {
+            add(token);
+        }
+
+        GGML_ASSERT(mtp_vocab_candidates.size() == mtp_vocab_capacity);
+        GGML_ASSERT(llama_set_mtp_vocab_candidates(
+                params.ctx_dft, mtp_vocab_candidates.data(), mtp_vocab_candidates.size()));
+    }
+
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
         }
         auto * ctx_dft = this->params.ctx_dft;
+
+        if (mtp_vocab_capacity > 0 && seq_id >= 0 && seq_id < (llama_seq_id) mtp_prompt_token_counts.size()) {
+            auto & counts = mtp_prompt_token_counts[seq_id];
+            counts.clear();
+            counts.reserve(std::min<size_t>(prompt.size(), mtp_vocab_capacity * 2));
+            for (llama_token token : prompt) {
+                ++counts[token];
+            }
+            mtp_recent_tokens.clear();
+            rebuild_mtp_vocab_candidates();
+            LOG_INF("%s: populated MTP prompt-local vocabulary: %zu rows from %zu unique prompt tokens\n",
+                    __func__, mtp_vocab_candidates.size(), counts.size());
+        }
+
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
         if (pos_max < N - 1) {
             LOG_WRN("%s: ctx_dft pos_max=%d < N-1=%d — "
@@ -1541,6 +1628,25 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
         }
 
         const int32_t n_tokens = batch_in.n_tokens;
+
+        if (mtp_vocab_capacity > 0 && !mtp_vocab_candidates.empty()) {
+            bool changed = false;
+            const size_t recent_limit = std::min<size_t>(2048, std::max<size_t>(64, mtp_vocab_capacity / 8));
+            for (int32_t i = 0; i < n_tokens; ++i) {
+                const llama_token token = batch_in.token[i];
+                if (mtp_vocab_candidate_set.find(token) != mtp_vocab_candidate_set.end()) {
+                    continue;
+                }
+                mtp_recent_tokens.push_back(token);
+                while (mtp_recent_tokens.size() > recent_limit) {
+                    mtp_recent_tokens.pop_front();
+                }
+                changed = true;
+            }
+            if (changed) {
+                rebuild_mtp_vocab_candidates();
+            }
+        }
 
         // remember the first and last batch index for each sequence
         std::fill(i_batch_beg.begin(), i_batch_beg.end(), -1);

@@ -107,6 +107,11 @@ LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_c
 // If masked == false, output embeddings for all tokens in the batch regardless of batch.logits.
 LLAMA_API void llama_set_embeddings_pre_norm(struct llama_context * ctx, bool value, bool masked = false);
 LLAMA_API void llama_set_mtp_source(struct llama_context * ctx, struct llama_context * src);
+LLAMA_API size_t llama_mtp_vocab_candidate_capacity(const struct llama_context * ctx);
+LLAMA_API bool llama_set_mtp_vocab_candidates(
+        struct llama_context * ctx,
+        const llama_token * tokens,
+        size_t n_tokens);
 LLAMA_API int32_t llama_model_n_embd_pre_norm(const struct llama_model * model);
 
 // Select which appended NextN block the DECODER_MTP graph runs (offset past
