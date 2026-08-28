@@ -50,6 +50,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 
 #include <algorithm>
 #include <cmath>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <tuple>
@@ -1822,11 +1823,22 @@ private:
 std::mutex vk_memory_logger::log_mutex;
 
 static bool vk_perf_logger_enabled = false;
+static bool vk_perf_logger_configured = false;
 static bool vk_perf_logger_concurrent = false;
 static bool vk_enable_sync_logger = false;
 // number of calls between perf logger prints
 static uint32_t vk_perf_logger_frequency = 1;
 static std::string vk_pipeline_stats_filter;
+static std::string vk_perf_logger_toggle_file;
+
+static bool ggml_vk_perf_logger_requested() {
+    if (vk_perf_logger_toggle_file.empty()) {
+        return vk_perf_logger_enabled;
+    }
+
+    std::ifstream toggle(vk_perf_logger_toggle_file);
+    return vk_perf_logger_enabled || toggle.good();
+}
 
 class vk_perf_logger {
   public:
@@ -6769,6 +6781,11 @@ static void ggml_vk_instance_init() {
     }
 
     vk_perf_logger_enabled = getenv("GGML_VK_PERF_LOGGER") != nullptr;
+    const char * perf_logger_toggle_file = getenv("GGML_VK_PERF_LOGGER_TOGGLE_FILE");
+    if (perf_logger_toggle_file != nullptr) {
+        vk_perf_logger_toggle_file = perf_logger_toggle_file;
+    }
+    vk_perf_logger_configured = vk_perf_logger_enabled || !vk_perf_logger_toggle_file.empty();
     vk_perf_logger_concurrent = getenv("GGML_VK_PERF_LOGGER_CONCURRENT") != nullptr;
     vk_enable_sync_logger = getenv("GGML_VK_SYNC_LOGGER") != nullptr;
     vk_memory_logger_enabled = getenv("GGML_VK_MEMORY_LOGGER") != nullptr;
@@ -6978,7 +6995,7 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
         ctx->transfer_cmd_pool.init(ctx->device, &ctx->device->transfer_queue);
     }
 
-    if (vk_perf_logger_enabled) {
+    if (vk_perf_logger_configured) {
         ctx->perf_logger = std::unique_ptr<vk_perf_logger>(new vk_perf_logger());
     }
 
@@ -15110,7 +15127,7 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
 
         ctx->transfer_cmd_pool.destroy(ctx->device->device);
     }
-    if (vk_perf_logger_enabled) {
+    if (vk_perf_logger_configured) {
         ctx->perf_logger->print_timings(true);
     }
 }
@@ -16194,6 +16211,7 @@ static int32_t find_first_set(uint32_t x) {
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    vk_perf_logger_enabled = ggml_vk_perf_logger_requested();
 
     if (vk_instance.debug_utils_support) {
         vk::DebugUtilsLabelEXT dul = {};
