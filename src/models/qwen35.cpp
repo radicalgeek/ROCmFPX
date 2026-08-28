@@ -636,9 +636,14 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
         ggml_set_input(inp_vocab->ids);
         ggml_set_name(inp_vocab->ids, "mtp_vocab_candidates");
 
-        ggml_tensor * selected_head = ggml_get_rows(ctx0, head_w, inp_vocab->ids);
-        cb(selected_head, "mtp_selected_head", -1);
-        ggml_tensor * selected_logits = build_lora_mm(selected_head, cur);
+        // Treat each vocabulary row as a one-output expert. Vulkan's indexed
+        // quantised matvec then reads and dequantises only selected Q8 rows in
+        // the dot-product shader, avoiding a large F32 gathered-weight tensor.
+        ggml_tensor * head_experts = ggml_reshape_3d(ctx0, head_w, head_w->ne[0], 1, n_vocab);
+        ggml_tensor * cur_expert = ggml_reshape_3d(ctx0, cur, cur->ne[0], 1, cur->ne[1]);
+        ggml_tensor * candidate_ids = ggml_repeat_4d(
+                ctx0, inp_vocab->ids, n_candidates, cur->ne[1], 1, 1);
+        ggml_tensor * selected_logits = ggml_mul_mat_id(ctx0, head_experts, cur_expert, candidate_ids);
         cb(selected_logits, "mtp_selected_logits", -1);
 
         // Preserve the standard [n_vocab, n_outputs] contract for samplers and
@@ -647,9 +652,9 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
                 ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab, selected_logits->ne[1]),
                 -INFINITY);
         cur = ggml_set_rows(ctx0, logits,
-                ggml_reshape_3d(ctx0, selected_logits, 1, n_candidates, selected_logits->ne[1]),
-                ggml_reshape_3d(ctx0, inp_vocab->ids, n_candidates, 1, 1));
-        cur = ggml_reshape_2d(ctx0, cur, n_vocab, selected_logits->ne[1]);
+                selected_logits,
+                candidate_ids);
+        cur = ggml_reshape_2d(ctx0, cur, n_vocab, cur->ne[2]);
 
         res->add_input(std::move(inp_vocab));
     } else {
