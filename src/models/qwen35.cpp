@@ -627,7 +627,9 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
 
-    if (params.mtp_vocab_candidates != nullptr && !params.mtp_vocab_candidates->empty()) {
+    if (params.mtp_vocab_candidates != nullptr &&
+        !params.mtp_vocab_candidates->empty() &&
+        cur->ne[1] > 0) {
         const int64_t n_candidates = (int64_t) params.mtp_vocab_candidates->size();
         const int64_t n_vocab = (int64_t) model.vocab.n_tokens();
 
