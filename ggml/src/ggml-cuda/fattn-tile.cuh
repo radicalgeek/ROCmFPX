@@ -497,17 +497,20 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile_q(
     constexpr int epc      = 8; // elements per thread chunk
     constexpr int ncalls   = epc / ne_call;
     static_assert(epc % ne_call == 0, "bad epc");
-    constexpr int nthreads = warp_size*nwarps;
-    constexpr int cpr      = J / epc; // chunks per row
+    constexpr int nthreads       = warp_size*nwarps;
+    constexpr int chunks_per_row = J / epc;
+    // Some launch variants instantiate an empty final K tile (J == 0). Keep
+    // its loop empty while retaining a valid compile-time divisor.
+    constexpr int cpr = chunks_per_row > 0 ? chunks_per_row : 1;
     static_assert(J % epc == 0, "bad J for dequant-on-load");
 
     const int tid = threadIdx.y*warp_size + threadIdx.x;
 
 #pragma unroll
-    for (int idx0 = 0; idx0 < I*cpr; idx0 += nthreads) {
+    for (int idx0 = 0; idx0 < I*chunks_per_row; idx0 += nthreads) {
         const int idx = idx0 + tid;
 
-        if (I*cpr % nthreads != 0 && idx >= I*cpr) {
+        if (I*chunks_per_row % nthreads != 0 && idx >= I*chunks_per_row) {
             continue;
         }
 
