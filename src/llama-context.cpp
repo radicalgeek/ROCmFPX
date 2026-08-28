@@ -237,7 +237,9 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: graph build timing enabled\n", __func__);
         }
 
-        if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        // Read the construction parameter directly. The MTP context type is
+        // selected by the server immediately before llama_init_from_model().
+        if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
             const char * env = getenv("LLAMA_MTP_VOCAB_SHORTLIST");
             if (env != nullptr) {
                 char * end = nullptr;

@@ -1506,6 +1506,7 @@ struct common_speculative_state_draft_mtp : public common_speculative_impl {
         drafting.assign(n_seq, 0);
 
         mtp_vocab_capacity = llama_mtp_vocab_candidate_capacity(ctx_dft);
+        LOG_INF("%s: - mtp_vocab_capacity=%zu\n", __func__, mtp_vocab_capacity);
         if (mtp_vocab_capacity > 0) {
             mtp_prompt_token_counts.resize(n_seq);
             mtp_vocab_candidates.reserve(mtp_vocab_capacity);
