@@ -10380,7 +10380,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
 
     tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k_fa_type, v_fa_type, f32acc);
     if (fused_gqa_queries && tuning_params.path == FA_SCALAR && fused_scalar_block_rows > 0) {
-        // Qwen width three expands to 18 rows and wastes 14 lanes across two
+        // Qwen3.8 width three expands to 24 rows and wastes 8 lanes across two
         // ordinary 16-row scalar workgroups. Experimental 24/32-row tiles
         // trade private state for one fewer full KV walk.
         tuning_params.block_rows = fused_scalar_block_rows;
